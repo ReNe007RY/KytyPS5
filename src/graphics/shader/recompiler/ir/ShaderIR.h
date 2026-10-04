@@ -14,6 +14,7 @@
 
 #include <array>
 #include <bit>
+#include <deque>
 #include <list>
 #include <memory>
 #include <optional>
@@ -29,6 +30,7 @@ enum class ResourceKind {
 	Buffer,
 	IndirectBuffer,
 	Flat,
+	FlatLocal,
 	Global,
 	Scratch,
 	Lds,
@@ -39,7 +41,8 @@ enum class ResourceKind {
 
 [[nodiscard]] constexpr bool IsAddressResourceKind(ResourceKind kind) {
 	return kind == ResourceKind::ScalarAddress || kind == ResourceKind::Flat ||
-	       kind == ResourceKind::Global || kind == ResourceKind::Scratch;
+	       kind == ResourceKind::FlatLocal || kind == ResourceKind::Global ||
+	       kind == ResourceKind::Scratch;
 }
 
 struct MemoryInfo {
@@ -66,7 +69,14 @@ struct MemoryInfo {
 	bool                    image_r128                                            = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
+	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+
+	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
+		return !formatted && !typed && data_bits == 32u &&
+		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
+		        opcode == ValueOpcode::LoadBufferU32x4);
+	}
 
 	bool operator==(const MemoryInfo& other) const = default;
 };
@@ -104,7 +114,7 @@ struct BufferResource {
 	bool operator==(const BufferResource& other) const = default;
 };
 
-enum class ImageMipMode { None, DynamicStorage };
+enum class ImageMipMode { None, Dynamic };
 
 constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
@@ -123,6 +133,7 @@ struct ImageResource {
 	bool                          read              = false;
 	bool                          written           = false;
 	bool                          atomic            = false;
+	bool                          atomic64          = false;
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
@@ -137,8 +148,12 @@ struct ImageResource {
 struct SamplerResource {
 	uint32_t source                = 0;
 	uint32_t first_use_pc          = 0;
+	// Native filtering/border variants share the original sampler's runtime descriptor.
+	uint32_t snapshot_index        = 0;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
+	bool     integer_border        = false;
+	bool     gather_lod            = false;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -267,7 +282,7 @@ struct StageOutput {
 inline constexpr uint32_t FirstImageBinding           = 1u;
 inline constexpr uint32_t FirstComparisonImageBinding = 22u;
 inline constexpr uint32_t FirstStorageImageBinding    = 29u;
-inline constexpr uint32_t ImageBindingCount           = 43u;
+inline constexpr uint32_t ImageBindingCount           = 48u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -280,8 +295,8 @@ enum class DescriptorBindingKind : uint32_t {
 	Count,
 };
 
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 55u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
@@ -358,7 +373,7 @@ DescriptorBindingForImage(const ImageResource& image) {
 			if (image.numeric_class != Prospero::TextureNumericClass::Uint) {
 				return std::nullopt;
 			}
-			base = AtomicUintBinding;
+			base = AtomicUintBinding + (image.atomic64 ? 5u : 0u);
 		} else {
 			switch (image.numeric_class) {
 				case Prospero::TextureNumericClass::Float: base = StorageFloatBinding; break;
@@ -427,7 +442,7 @@ struct BindingLayout {
 };
 
 struct ShaderInfo {
-	static constexpr uint32_t MaxBuffers      = 32;
+	static constexpr uint32_t MaxBuffers      = 64;
 	static constexpr uint32_t MaxImages       = 64;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
@@ -458,11 +473,14 @@ struct BlockInfo {
 
 struct DescriptorSource {
 	struct IndirectImage {
-		uint32_t material_source = 0;
-		uint32_t heap_source     = 0;
+		uint32_t material_source = UINT32_MAX;
+		uint32_t table_source    = 0;
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
-		uint32_t key_arg         = 0;
+		uint32_t table_offset    = 0;
+		Value    key_count;
+		Value    selector_mask;
+		std::vector<uint32_t> sources;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};
@@ -486,6 +504,7 @@ struct ResourceBlock {
 	Value                 condition;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> sources;
+	std::vector<uint32_t> srt_reads;
 };
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
@@ -497,6 +516,7 @@ struct CompiledShaderInfo {
 	uint32_t                      user_data_count     = 64;
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
+	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
 };
@@ -506,9 +526,19 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
-// Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
-// uniform condition and fill values without retaining translated blocks.
+// Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
+// condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
+	struct EvaluationContext {
+		struct Entry {
+			uint64_t value      = 0;
+			uint64_t generation = 0;
+		};
+
+		std::vector<Entry> values;
+		uint64_t           generation = 0;
+	};
+
 	ResourcePlan() = default;
 	~ResourcePlan();
 
@@ -525,14 +555,22 @@ struct ResourcePlan {
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
-	std::vector<uint32_t>               materialization_sources;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
+	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
+	mutable std::deque<EvaluationContext> evaluation_contexts;
+	mutable uint32_t                       evaluation_value_count = 0;
+	mutable uint32_t                       evaluation_depth       = 0;
+	mutable std::vector<uint8_t>            active_sources;
+	mutable std::vector<uint8_t>            visited_blocks;
+	mutable std::vector<uint32_t>           pending_blocks;
+	mutable std::vector<uint32_t>           material_keys;
 };
 
 struct Program: ResourcePlan {
@@ -553,10 +591,12 @@ struct Program: ResourcePlan {
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	std::vector<BlockInfo>        block_info;
+	struct ScalarWrite { uint32_t pc; ScalarReg reg; };
+	std::vector<ScalarWrite>      scalar_writes;
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
-	std::vector<Value>            dynamic_reads;
+	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;

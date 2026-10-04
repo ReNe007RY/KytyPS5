@@ -63,16 +63,34 @@ uint32_t LdsDwordCount(const EmitterState& state) {
 	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
 }
 
-static void EnsureLdsStorage(EmitterState& state) {
+void EnsureLdsStorage(EmitterState& state) {
 	if (state.lds_variable != 0) {
 		return;
 	}
 	if (ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
 		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
-	state.lds_variable = state.builder.DefineGlobalVariable(
-	    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, LdsDwordCount(state)),
-	    spv::StorageClassWorkgroup);
+	const auto define = [&](uint32_t type, uint32_t bytes) {
+		const auto array = state.builder.DecoratedType(
+		    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, bytes}}}, type,
+		    ConstantU32(state, std::max(LdsDwordCount(state) * 4u / bytes, 1u)));
+		const auto block = state.builder.DecoratedType(
+		    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+		                        {spv::OpDecorate, {spv::DecorationBlock}}}, array);
+		const auto variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassWorkgroup, block), spv::StorageClassWorkgroup);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
+		return variable;
+	};
+	if (state.requirements.shared_int64_atomics) {
+		state.lds_variable = define(TypeU32(state), 4u);
+		state.lds_u64_variable = define(TypeScalarU64(state), 8u);
+		state.builder.AddName(state.lds_u64_variable, "lds_qwords");
+	} else {
+		state.lds_variable = state.builder.DefineGlobalVariable(
+		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, LdsDwordCount(state)),
+		    spv::StorageClassWorkgroup);
+	}
 	state.builder.AddName(state.lds_variable, "lds_dwords");
 }
 
@@ -86,7 +104,9 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	}
 	const auto array_index =
 	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
-	MemoryResourceAccess access {.kind = mem.kind};
+	MemoryResourceAccess access {
+	    .kind = mem.kind,
+	    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone};
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
 	                          ConstantU32(state, array_index));
@@ -165,6 +185,11 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 		    : ShaderWorkgroupInput(state.program.stage, state.input_info) != nullptr
 		        ? spv::StorageClassWorkgroup
 		        : spv::StorageClassFunction;
+		if (access.kind == IR::ResourceKind::Lds && state.requirements.shared_int64_atomics) {
+			state.builder.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, storage_class),
+			                          pointer, access.object_pointer, ConstantU32(state, 0), index);
+			return pointer;
+		}
 		state.builder.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, storage_class),
 		                          pointer, access.object_pointer, index);
 		return pointer;
@@ -281,11 +306,83 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 	}
 }
 
-void EmitDeviceAtomicMemoryBarrier(EmitterState& state) {
-	const auto semantics =
-	    spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsUniformMemoryMask;
-	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
-	                          ConstantU32(state, semantics));
+spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
+	switch (opcode) {
+		case IR::ValueOpcode::ImageAtomicCompareSwap32:
+		case IR::ValueOpcode::BufferAtomicCmpSwap32: return spv::OpAtomicCompareExchange;
+		case IR::ValueOpcode::ImageAtomicSwap32:
+		case IR::ValueOpcode::BufferAtomicSwap32:
+		case IR::ValueOpcode::BufferAtomicSwap64:
+		case IR::ValueOpcode::SharedAtomicSwap32: return spv::OpAtomicExchange;
+		case IR::ValueOpcode::ImageAtomicIAdd32:
+		case IR::ValueOpcode::BufferAtomicIAdd32:
+		case IR::ValueOpcode::SharedAtomicIAdd64:
+		case IR::ValueOpcode::SharedAtomicIAdd32: return spv::OpAtomicIAdd;
+		case IR::ValueOpcode::BufferAtomicISub32:
+		case IR::ValueOpcode::SharedAtomicISub32: return spv::OpAtomicISub;
+		case IR::ValueOpcode::ImageAtomicSMin32:
+		case IR::ValueOpcode::BufferAtomicSMin32:
+		case IR::ValueOpcode::SharedAtomicSMin32: return spv::OpAtomicSMin;
+		case IR::ValueOpcode::ImageAtomicUMin32:
+		case IR::ValueOpcode::BufferAtomicUMin32:
+		case IR::ValueOpcode::SharedAtomicUMin32: return spv::OpAtomicUMin;
+		case IR::ValueOpcode::ImageAtomicSMax32:
+		case IR::ValueOpcode::BufferAtomicSMax32:
+		case IR::ValueOpcode::SharedAtomicSMax32: return spv::OpAtomicSMax;
+		case IR::ValueOpcode::ImageAtomicUMax32:
+		case IR::ValueOpcode::ImageAtomicUMax64:
+		case IR::ValueOpcode::BufferAtomicUMax32:
+		case IR::ValueOpcode::SharedAtomicUMax32: return spv::OpAtomicUMax;
+		case IR::ValueOpcode::ImageAtomicAnd32:
+		case IR::ValueOpcode::BufferAtomicAnd32:
+		case IR::ValueOpcode::BufferAtomicAnd64:
+		case IR::ValueOpcode::SharedAtomicAnd32: return spv::OpAtomicAnd;
+		case IR::ValueOpcode::ImageAtomicOr32:
+		case IR::ValueOpcode::BufferAtomicOr32:
+		case IR::ValueOpcode::BufferAtomicOr64:
+		case IR::ValueOpcode::SharedAtomicOr64:
+		case IR::ValueOpcode::SharedAtomicOr32: return spv::OpAtomicOr;
+		case IR::ValueOpcode::ImageAtomicXor32:
+		case IR::ValueOpcode::BufferAtomicXor32:
+		case IR::ValueOpcode::SharedAtomicXor32: return spv::OpAtomicXor;
+		default: return spv::OpNop;
+	}
+}
+
+uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t pointer,
+                             uint32_t scope) {
+	const auto opcode = SpirvAtomicOpcode(inst.GetOpcode());
+	const auto old    = ctx.state.builder.AllocateId();
+	const bool wide   = inst.GetType() == IR::Type::U64;
+	const auto type   = wide ? TypeScalarU64(ctx.state) : TypeU32(ctx.state);
+	if (opcode == spv::OpAtomicCompareExchange) {
+		const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
+		const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+		ctx.state.builder.AddFunction(
+		    spv::OpAtomicCompareExchange, TypeU32(ctx.state), old, pointer,
+		    ConstantU32(ctx.state, scope), ConstantU32(ctx.state, spv::MemorySemanticsMaskNone),
+		    ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), desired, comparator);
+	} else {
+		auto value = ctx.Arg(inst, inst.NumArgs() - 2);
+		if (wide) value = Unary(ctx.state, spv::OpBitcast, type, value);
+		ctx.state.builder.AddFunction(opcode, type, old, pointer,
+		                              ConstantU32(ctx.state, scope),
+		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), value);
+	}
+	return wide ? Unary(ctx.state, spv::OpBitcast, TypeU64(ctx.state), old) : old;
+}
+
+void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {
+	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
+	const auto memory = [&] {
+		switch (kind) {
+			case IR::ResourceKind::Lds: return spv::MemorySemanticsWorkgroupMemoryMask;
+			case IR::ResourceKind::Image: return spv::MemorySemanticsImageMemoryMask;
+			default: return spv::MemorySemanticsUniformMemoryMask;
+		}
+	}();
+	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, scope),
+	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
 }
 
 uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,

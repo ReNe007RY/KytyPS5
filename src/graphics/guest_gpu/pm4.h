@@ -697,6 +697,8 @@ constexpr uint32_t CX_NUM = 0x3FF + 1;
 
 /* Shader registers */
 
+constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_LO_PS = 0x2;
+constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_HI_PS = 0x3;
 constexpr uint32_t SPI_SHADER_PACE_ID_PS            = 0x6;
 constexpr uint32_t SPI_GRAPHICS_SHADER_CONTROL_PS    = 0x7;
 constexpr uint32_t SPI_SHADER_PGM_LO_PS              = 0x8;
@@ -910,6 +912,7 @@ constexpr uint32_t COMPUTE_PGM_RSRC1_WGP_MODE_MASK    = 0x1;
 constexpr uint32_t COMPUTE_PGM_RSRC1_FWD_PROGRESS_SHIFT = 31;
 constexpr uint32_t COMPUTE_PGM_RSRC1_FWD_PROGRESS_MASK  = 0x1;
 
+constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
 constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT = 15;
 constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK  = 0x1;
 

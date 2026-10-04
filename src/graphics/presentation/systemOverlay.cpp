@@ -1,6 +1,7 @@
 #include "graphics/presentation/systemOverlay.h"
 
-#include "SDL.h"
+#include <SDL3/SDL.h>
+
 #include "common/assert.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -28,9 +29,9 @@ namespace Libs::Graphics {
 
 namespace {
 
-namespace CoreIme   = Libs::Ime;
-namespace DialogIme = Libs::Dialog::ImeDialog;
-namespace ErrorDialog = Libs::Dialog::ErrorDialog;
+namespace CoreIme      = Libs::Ime;
+namespace DialogIme    = Libs::Dialog::ImeDialog;
+namespace SystemDialog = Libs::Dialog::SystemDialog;
 
 namespace Ime {
 
@@ -103,7 +104,7 @@ bool HostQueueExternalInput(uint64_t generation, ExternalInput input) {
 
 } // namespace Ime
 
-enum class OverlayKind : uint8_t { None, Ime, Error };
+enum class OverlayKind : uint8_t { None, Ime, Dialog };
 
 struct OverlaySession {
 	OverlayKind kind       = OverlayKind::None;
@@ -113,14 +114,14 @@ struct OverlaySession {
 };
 
 struct OverlaySnapshot {
-	OverlaySession            session;
-	Ime::HostSnapshot         ime;
-	ErrorDialog::HostSnapshot error;
+	OverlaySession             session;
+	Ime::HostSnapshot          ime;
+	SystemDialog::HostSnapshot dialog;
 };
 
 bool GetOverlaySnapshot(OverlaySnapshot* snapshot) {
-	if (ErrorDialog::GetHostSnapshot(&snapshot->error)) {
-		snapshot->session = {OverlayKind::Error, snapshot->error.generation};
+	if (SystemDialog::GetHostSnapshot(&snapshot->dialog)) {
+		snapshot->session = {OverlayKind::Dialog, snapshot->dialog.generation};
 		return true;
 	}
 	if (Ime::GetHostSnapshot(&snapshot->ime)) {
@@ -176,6 +177,7 @@ bool                         g_input_multiline            = false;
 bool                         g_input_lifecycle_active     = false;
 bool                         g_controller_captured        = false;
 OverlaySession               g_session;
+SDL_Window*                  g_input_window               = nullptr;
 
 void ClearInputEvents() {
 	std::scoped_lock lock(g_input_mutex);
@@ -212,7 +214,7 @@ void RetryVisibilityWakeup() {
 	}
 	SDL_Event event {};
 	event.type = type;
-	if (SDL_PushEvent(&event) > 0) {
+	if (SDL_PushEvent(&event)) {
 		g_missing_visibility_wakeups--;
 	}
 }
@@ -232,7 +234,7 @@ void RefreshVisibility() {
 	bool capture_keyboard   = false;
 	bool text_input         = false;
 	bool multiline          = false;
-	if (snapshot.session.kind == OverlayKind::Error) {
+	if (snapshot.session.kind == OverlayKind::Dialog) {
 		capture_controller = true;
 		capture_keyboard   = true;
 	} else if (snapshot.session.kind == OverlayKind::Ime) {
@@ -252,7 +254,7 @@ void RefreshVisibility() {
 		std::scoped_lock input_lock(g_input_mutex);
 		g_visibility_updates.push_back({snapshot.session, visible, capture_controller,
 		                                capture_keyboard, text_input, multiline});
-		if (g_missing_visibility_wakeups != 0 || SDL_PushEvent(&event) <= 0) {
+		if (g_missing_visibility_wakeups != 0 || !SDL_PushEvent(&event)) {
 			g_missing_visibility_wakeups++;
 		}
 	}
@@ -268,16 +270,16 @@ void OnDialogVisibilityChanged(bool, uint64_t) {
 
 uint32_t ExternalKeyStatus(SDL_Keymod modifiers, bool character_valid) {
 	uint32_t status = 0x00000001 | (character_valid ? 0x00000002 : 0);
-	if ((modifiers & KMOD_LCTRL) != 0) status |= 0x00000100;
-	if ((modifiers & KMOD_LSHIFT) != 0) status |= 0x00000200;
-	if ((modifiers & KMOD_LALT) != 0) status |= 0x00000400;
-	if ((modifiers & KMOD_LGUI) != 0) status |= 0x00000800;
-	if ((modifiers & KMOD_RCTRL) != 0) status |= 0x00001000;
-	if ((modifiers & KMOD_RSHIFT) != 0) status |= 0x00002000;
-	if ((modifiers & KMOD_RALT) != 0) status |= 0x00004000;
-	if ((modifiers & KMOD_RGUI) != 0) status |= 0x00008000;
-	if ((modifiers & KMOD_NUM) != 0) status |= 0x00010000;
-	if ((modifiers & KMOD_CAPS) != 0) status |= 0x00020000;
+	if ((modifiers & SDL_KMOD_LCTRL) != 0) status |= 0x00000100;
+	if ((modifiers & SDL_KMOD_LSHIFT) != 0) status |= 0x00000200;
+	if ((modifiers & SDL_KMOD_LALT) != 0) status |= 0x00000400;
+	if ((modifiers & SDL_KMOD_LGUI) != 0) status |= 0x00000800;
+	if ((modifiers & SDL_KMOD_RCTRL) != 0) status |= 0x00001000;
+	if ((modifiers & SDL_KMOD_RSHIFT) != 0) status |= 0x00002000;
+	if ((modifiers & SDL_KMOD_RALT) != 0) status |= 0x00004000;
+	if ((modifiers & SDL_KMOD_RGUI) != 0) status |= 0x00008000;
+	if ((modifiers & SDL_KMOD_NUM) != 0) status |= 0x00010000;
+	if ((modifiers & SDL_KMOD_CAPS) != 0) status |= 0x00020000;
 	return status;
 }
 
@@ -392,14 +394,14 @@ float AlignmentPivot(Ime::Alignment alignment) {
 
 ImGuiKey ControllerButtonToKey(int button) {
 	switch (button) {
-		case SDL_CONTROLLER_BUTTON_A: return ImGuiKey_GamepadFaceDown;
-		case SDL_CONTROLLER_BUTTON_B: return ImGuiKey_GamepadFaceRight;
-		case SDL_CONTROLLER_BUTTON_X: return ImGuiKey_GamepadFaceLeft;
-		case SDL_CONTROLLER_BUTTON_Y: return ImGuiKey_GamepadFaceUp;
-		case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return ImGuiKey_GamepadDpadLeft;
-		case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return ImGuiKey_GamepadDpadRight;
-		case SDL_CONTROLLER_BUTTON_DPAD_UP: return ImGuiKey_GamepadDpadUp;
-		case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return ImGuiKey_GamepadDpadDown;
+		case SDL_GAMEPAD_BUTTON_SOUTH: return ImGuiKey_GamepadFaceDown;
+		case SDL_GAMEPAD_BUTTON_EAST: return ImGuiKey_GamepadFaceRight;
+		case SDL_GAMEPAD_BUTTON_WEST: return ImGuiKey_GamepadFaceLeft;
+		case SDL_GAMEPAD_BUTTON_NORTH: return ImGuiKey_GamepadFaceUp;
+		case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return ImGuiKey_GamepadDpadLeft;
+		case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return ImGuiKey_GamepadDpadRight;
+		case SDL_GAMEPAD_BUTTON_DPAD_UP: return ImGuiKey_GamepadDpadUp;
+		case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return ImGuiKey_GamepadDpadDown;
 		default: return ImGuiKey_None;
 	}
 }
@@ -415,9 +417,11 @@ void CheckVulkanResult(VkResult result) {
 
 } // namespace
 
-void InitializeSystemOverlayInput() {
+void InitializeSystemOverlayInput(SDL_Window* window) {
+	EXIT_IF(window == nullptr);
 	const Uint32 type = SDL_RegisterEvents(1);
 	EXIT_IF(type == static_cast<Uint32>(-1));
+	g_input_window = window;
 	{
 		std::scoped_lock lock(g_visibility_mutex);
 		g_input_lifecycle_active = true;
@@ -425,14 +429,14 @@ void InitializeSystemOverlayInput() {
 	}
 	CoreIme::SetVisibilityCallback(OnCoreVisibilityChanged);
 	DialogIme::SetVisibilityCallback(OnDialogVisibilityChanged);
-	ErrorDialog::SetVisibilityCallback(RefreshVisibility);
+	SystemDialog::SetVisibilityCallback(RefreshVisibility);
 	RefreshVisibility();
 }
 
 void ShutdownSystemOverlayInput() {
 	CoreIme::SetVisibilityCallback(nullptr);
 	DialogIme::SetVisibilityCallback(nullptr);
-	ErrorDialog::SetVisibilityCallback(nullptr);
+	SystemDialog::SetVisibilityCallback(nullptr);
 	{
 		std::scoped_lock lock(g_visibility_mutex);
 		g_input_lifecycle_active = false;
@@ -453,17 +457,18 @@ void ShutdownSystemOverlayInput() {
 	g_input_controller = false;
 	g_input_keyboard   = false;
 	g_input_multiline  = false;
-	if (SDL_IsTextInputActive() == SDL_TRUE) {
-		SDL_StopTextInput();
+	if (g_input_window != nullptr && SDL_TextInputActive(g_input_window)) {
+		SDL_StopTextInput(g_input_window);
 	}
+	g_input_window = nullptr;
 }
 
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
-	const auto error  = ErrorDialog::GetVisualState();
-	return {core.active || dialog.active || error.active,
-	        core.revision + dialog.revision + error.revision};
+	const auto system = SystemDialog::GetVisualState();
+	return {core.active || dialog.active || system.active,
+	        core.revision + dialog.revision + system.revision};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -487,13 +492,13 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		g_input_keyboard        = update.capture_keyboard;
 		g_input_multiline       = update.multiline;
 		if (update.text_input) {
-			SDL_StartTextInput();
-		} else if (SDL_IsTextInputActive() == SDL_TRUE) {
-			SDL_StopTextInput();
+			SDL_StartTextInput(g_input_window);
+		} else if (SDL_TextInputActive(g_input_window)) {
+			SDL_StopTextInput(g_input_window);
 		}
 		return true;
 	}
-	if (event.type == SDL_CONTROLLERDEVICEREMOVED) {
+	if (event.type == SDL_EVENT_GAMEPAD_REMOVED) {
 		if (g_input_active && g_input_controller) {
 			QueueInput({InputKind::ResetController, g_input_session, 0, 0.0f, 0.0f});
 		}
@@ -505,26 +510,27 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 
 	const auto     session          = g_input_session;
 	const uint64_t generation       = session.generation;
-	const bool     controller_event = event.type == SDL_CONTROLLERBUTTONDOWN ||
-	                                  event.type == SDL_CONTROLLERBUTTONUP ||
-	                                  event.type == SDL_CONTROLLERAXISMOTION;
+	const bool     controller_event = event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+	                                  event.type == SDL_EVENT_GAMEPAD_BUTTON_UP ||
+	                                  event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION;
 	if (controller_event && !g_input_controller) {
 		return false;
 	}
-	const bool keyboard_event = event.type == SDL_TEXTINPUT || event.type == SDL_TEXTEDITING ||
-	                            event.type == SDL_KEYDOWN || event.type == SDL_KEYUP;
+	const bool keyboard_event = event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_TEXT_EDITING ||
+	                            event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP;
 	if (keyboard_event && !g_input_keyboard) {
 		return false;
 	}
-	if (keyboard_event && session.kind == OverlayKind::Error) {
-		if (event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
-		    (event.key.keysym.sym == SDLK_RETURN || event.key.keysym.sym == SDLK_KP_ENTER)) {
-			ErrorDialog::HostAccept(generation);
+	if (keyboard_event && session.kind == OverlayKind::Dialog) {
+		if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+		    (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER ||
+		     event.key.key == SDLK_ESCAPE)) {
+			SystemDialog::HostClose(generation);
 		}
 		return true;
 	}
 	switch (event.type) {
-		case SDL_TEXTINPUT: {
+		case SDL_EVENT_TEXT_INPUT: {
 			const auto text = Utf8ToUtf16(event.text.text);
 			if (!text.empty()) {
 				auto input = MakeExternalInput(Ime::ExternalAction::Text, g_last_external_keycode,
@@ -535,26 +541,24 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 			}
 			return true;
 		}
-		case SDL_TEXTEDITING: return true;
-		case SDL_KEYDOWN: {
-			g_last_external_keycode = static_cast<uint16_t>(event.key.keysym.scancode);
-			g_last_external_status =
-			    ExternalKeyStatus(static_cast<SDL_Keymod>(event.key.keysym.mod), false);
+		case SDL_EVENT_TEXT_EDITING: return true;
+		case SDL_EVENT_KEY_DOWN: {
+			g_last_external_keycode = static_cast<uint16_t>(event.key.scancode);
+			g_last_external_status  = ExternalKeyStatus(event.key.mod, false);
 			auto action = Ime::ExternalAction::Text;
 			bool queue  = true;
-			if (event.key.keysym.sym == SDLK_BACKSPACE) {
+			if (event.key.key == SDLK_BACKSPACE) {
 				action = Ime::ExternalAction::Backspace;
-			} else if (event.key.keysym.sym == SDLK_LEFT) {
+			} else if (event.key.key == SDLK_LEFT) {
 				action = Ime::ExternalAction::MoveLeft;
-			} else if (event.key.keysym.sym == SDLK_RIGHT) {
+			} else if (event.key.key == SDLK_RIGHT) {
 				action = Ime::ExternalAction::MoveRight;
-			} else if (event.key.keysym.sym == SDLK_ESCAPE) {
+			} else if (event.key.key == SDLK_ESCAPE) {
 				action = Ime::ExternalAction::Cancel;
-			} else if (event.key.keysym.sym == SDLK_RETURN ||
-			           event.key.keysym.sym == SDLK_KP_ENTER) {
+			} else if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) {
 				action =
 				    g_input_multiline ? Ime::ExternalAction::Newline : Ime::ExternalAction::Accept;
-			} else if (event.key.keysym.sym == SDLK_TAB) {
+			} else if (event.key.key == SDLK_TAB) {
 				action = Ime::ExternalAction::None;
 			} else {
 				queue = false;
@@ -566,28 +570,28 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 			}
 			return true;
 		}
-		case SDL_KEYUP: return true;
-		case SDL_CONTROLLERBUTTONDOWN:
-		case SDL_CONTROLLERBUTTONUP:
-			QueueInput({InputKind::Button, session, event.cbutton.button,
-			            event.type == SDL_CONTROLLERBUTTONDOWN ? 1.0f : 0.0f, 0.0f});
+		case SDL_EVENT_KEY_UP: return true;
+		case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+		case SDL_EVENT_GAMEPAD_BUTTON_UP:
+			QueueInput({InputKind::Button, session, event.gbutton.button,
+			            event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ? 1.0f : 0.0f, 0.0f});
 			return true;
-		case SDL_CONTROLLERAXISMOTION:
-			QueueInput({InputKind::Axis, session, event.caxis.axis,
-			            static_cast<float>(event.caxis.value), 0.0f});
+		case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+			QueueInput({InputKind::Axis, session, event.gaxis.axis,
+			            static_cast<float>(event.gaxis.value), 0.0f});
 			return true;
-		case SDL_MOUSEMOTION:
+		case SDL_EVENT_MOUSE_MOTION:
 			QueueInput({InputKind::MousePosition, session, 0, static_cast<float>(event.motion.x),
 			            static_cast<float>(event.motion.y)});
 			return true;
-		case SDL_MOUSEBUTTONDOWN:
-		case SDL_MOUSEBUTTONUP:
+		case SDL_EVENT_MOUSE_BUTTON_DOWN:
+		case SDL_EVENT_MOUSE_BUTTON_UP:
 			QueueInput({InputKind::MousePosition, session, 0, static_cast<float>(event.button.x),
 			            static_cast<float>(event.button.y)});
 			QueueInput({InputKind::MouseButton, session, event.button.button,
-			            event.type == SDL_MOUSEBUTTONDOWN ? 1.0f : 0.0f, 0.0f});
+			            event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ? 1.0f : 0.0f, 0.0f});
 			return true;
-		case SDL_MOUSEWHEEL:
+		case SDL_EVENT_MOUSE_WHEEL:
 			QueueInput({InputKind::MouseWheel, session, 0, static_cast<float>(event.wheel.x),
 			            static_cast<float>(event.wheel.y)});
 			return true;
@@ -681,9 +685,9 @@ struct SystemOverlay::Impl {
 				case InputKind::Button: {
 					const bool down = event.x != 0.0f;
 					if (session.kind == OverlayKind::Ime && down) {
-						if (event.id == SDL_CONTROLLER_BUTTON_B) {
+						if (event.id == SDL_GAMEPAD_BUTTON_EAST) {
 							Ime::HostCancel(session.generation);
-						} else if (event.id == SDL_CONTROLLER_BUTTON_Y) {
+						} else if (event.id == SDL_GAMEPAD_BUTTON_NORTH) {
 							Ime::HostBackspace(session.generation);
 						}
 					}
@@ -695,19 +699,19 @@ struct SystemOverlay::Impl {
 				}
 				case InputKind::Axis: {
 					const float value = event.x / (event.x < 0.0f ? 32768.0f : 32767.0f);
-					if (event.id == SDL_CONTROLLER_AXIS_LEFTX) {
+					if (event.id == SDL_GAMEPAD_AXIS_LEFTX) {
 						io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickLeft, value < -0.25f,
 						                     std::max(-value, 0.0f));
 						io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickRight, value > 0.25f,
 						                     std::max(value, 0.0f));
-					} else if (event.id == SDL_CONTROLLER_AXIS_LEFTY) {
+					} else if (event.id == SDL_GAMEPAD_AXIS_LEFTY) {
 						io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickUp, value < -0.25f,
 						                     std::max(-value, 0.0f));
 						io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickDown, value > 0.25f,
 						                     std::max(value, 0.0f));
-					} else if (event.id == SDL_CONTROLLER_AXIS_RIGHTX) {
+					} else if (event.id == SDL_GAMEPAD_AXIS_RIGHTX) {
 						right_stick.x = std::abs(value) > 0.2f ? value : 0.0f;
-					} else if (event.id == SDL_CONTROLLER_AXIS_RIGHTY) {
+					} else if (event.id == SDL_GAMEPAD_AXIS_RIGHTY) {
 						right_stick.y = std::abs(value) > 0.2f ? value : 0.0f;
 					}
 					break;
@@ -901,7 +905,7 @@ struct SystemOverlay::Impl {
 		ImGui::End();
 	}
 
-	void DrawError(const ErrorDialog::HostSnapshot& snapshot, vk::Extent2D extent) {
+	void DrawDialog(const SystemDialog::HostSnapshot& snapshot, vk::Extent2D extent) {
 		const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
 		const float  scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.5f);
 		ImGui::GetBackgroundDrawList()->AddRectFilled({0.0f, 0.0f}, display,
@@ -919,17 +923,23 @@ struct SystemOverlay::Impl {
 		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
 		                                   ImGuiWindowFlags_NoSavedSettings |
 		                                   ImGuiWindowFlags_AlwaysAutoResize;
-		ImGui::Begin("##SystemError", nullptr, flags);
-		ImGui::TextUnformatted("Error");
+		const bool                 signin = snapshot.kind == SystemDialog::Kind::Signin;
+		ImGui::Begin("##SystemDialog", nullptr, flags);
+		ImGui::TextUnformatted(signin ? "Sign in to PlayStation Network" : "Error");
 		ImGui::Separator();
 		const auto error_code = static_cast<uint32_t>(snapshot.error_code);
-		ImGui::TextWrapped("%s", error_code == 0x80550006u
+		ImGui::TextWrapped("%s", signin ? "PlayStation Network sign-in is unavailable."
+		                         : error_code == 0x80550006u
 		                             ? "You are not signed in to PlayStation Network."
 		                             : "An error has occurred.");
-		ImGui::TextDisabled("Error code: 0x%08X", error_code);
+		if (!signin) {
+			ImGui::TextDisabled("Error code: 0x%08X", error_code);
+		}
 		const float button_width = std::min(140.0f * scale, ImGui::GetContentRegionAvail().x);
 		ImGui::SetCursorPosX((ImGui::GetWindowSize().x - button_width) * 0.5f);
-		const bool accepted = ImGui::Button("OK", {button_width, 44.0f * scale});
+		const bool accepted =
+		    ImGui::Button(signin ? "Cancel" : "OK", {button_width, 44.0f * scale}) ||
+		    (signin && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false));
 		if (focus_pending) {
 			ImGui::SetItemDefaultFocus();
 			focus_pending = false;
@@ -938,7 +948,7 @@ struct SystemOverlay::Impl {
 		ImGui::PopFont();
 		ImGui::PopStyleVar(2);
 		if (accepted) {
-			ErrorDialog::HostAccept(snapshot.generation);
+			SystemDialog::HostClose(snapshot.generation);
 		}
 	}
 
@@ -952,7 +962,8 @@ struct SystemOverlay::Impl {
 		if (session != snapshot.session) {
 			session       = snapshot.session;
 			focus_pending = true;
-			shift         = (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
+			shift         = session.kind == OverlayKind::Ime &&
+			                (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
 			symbol_mode   = false;
 			panel_offset  = {};
 			right_stick   = {};
@@ -978,8 +989,8 @@ struct SystemOverlay::Impl {
 			ImGui::EndFrame();
 			return false;
 		}
-		if (snapshot.session.kind == OverlayKind::Error) {
-			DrawError(snapshot.error, frame_extent);
+		if (snapshot.session.kind == OverlayKind::Dialog) {
+			DrawDialog(snapshot.dialog, frame_extent);
 		} else {
 			DrawIme(snapshot.ime, frame_extent);
 		}
