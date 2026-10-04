@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvOptimizer.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
@@ -23,6 +24,7 @@
 #include <fmt/format.h>
 #include <map>
 #include <span>
+#include <string>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -684,6 +686,27 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
+	if (options.optimization_type != Config::ShaderOptimizationType::None) {
+		const auto  optimize_begin = std::chrono::steady_clock::now();
+		const auto  original_words = spirv.size();
+		std::string diagnostics;
+		const bool  optimized = Spirv::Optimize(spirv, options.optimization_type, diagnostics);
+		LOGF("%s SPIR-V optimize: stage=%s hash=0x%016" PRIx64
+		     " mode=%s words=%zu->%zu elapsed_ms=%" PRIu64 " fallback=%s\n",
+		     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,
+		     options.optimization_type == Config::ShaderOptimizationType::Performance
+		         ? "Performance"
+		         : "Size",
+		     original_words, spirv.size(),
+		     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                               std::chrono::steady_clock::now() - optimize_begin)
+		                               .count()),
+		     optimized ? "false" : "true");
+		if (!optimized) {
+			LOGF("%s SPIR-V optimization failed; using original shader: %s\n",
+			     GetDumpLabel(options), diagnostics.c_str());
+		}
+	}
 	CompileResult result;
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);

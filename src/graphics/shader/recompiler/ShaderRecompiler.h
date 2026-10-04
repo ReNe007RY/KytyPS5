@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERRECOMPILER_H_
 
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -19,6 +20,7 @@ struct CompileOptions {
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
 	const char*                 dump_label                 = nullptr;
+	Config::ShaderOptimizationType optimization_type       = Config::ShaderOptimizationType::None;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
