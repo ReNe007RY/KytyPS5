@@ -10,7 +10,6 @@
 #include <cpuid.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#include <intrin.h> // IWYU pragma: keep
 #include <windows.h> // IWYU pragma: keep
 #elif defined(__APPLE__)
 #include <sys/ucontext.h>
@@ -76,7 +75,10 @@ struct XmmWords {
 
 static uint64_t ReadHostTsc() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || (defined(__x86_64__) && !defined(__APPLE__))
-	return __rdtsc();
+	uint32_t low  = 0;
+	uint32_t high = 0;
+	asm volatile("rdtsc" : "=a"(low), "=d"(high));
+	return (static_cast<uint64_t>(high) << 32u) | low;
 #else
 	return 0;
 #endif
@@ -735,9 +737,9 @@ static bool TryEmulateSse4a(Context& context) {
 	if (rip[offset] != 0x0f) {
 		return false;
 	}
-	const uint8_t opcode           = rip[offset + 1];
-	const bool    register_extract = prefix == 0x66 && opcode == 0x79;
-	if (opcode != 0x78 && !register_extract && opcode != 0x2b) {
+	const uint8_t opcode        = rip[offset + 1];
+	const bool    register_form = opcode == 0x79;
+	if (opcode != 0x78 && !register_form && opcode != 0x2b) {
 		return false;
 	}
 
